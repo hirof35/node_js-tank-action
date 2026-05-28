@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>2D 戦車バトル</title>
+    <style>
+        body { margin: 0; background: #222; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; font-family: Arial, sans-serif; }
+        /* ─── 追加：コントロールパネルのスタイル ─── */
+        #controlPanel { margin-bottom: 15px; color: #fff; }
+        .diff-btn { background: #444; color: #fff; border: 2px solid #666; padding: 6px 12px; margin: 0 5px; cursor: pointer; border-radius: 4px; font-weight: bold; }
+        .diff-btn:hover { background: #555; }
+        .diff-btn.active { background: #00cc44; border-color: #fff; box-shadow: 0 0 10px #00cc44; }
+        canvas { background: #333; border: 2px solid #fff; }
+    </style>
+</head>
+<body>
+
+<div id="controlPanel">
+    難易度設定: 
+    <button class="diff-btn" id="btn-easy" onclick="setDifficulty('easy')">かんたん</button>
+    <button class="diff-btn active" id="btn-normal" onclick="setDifficulty('normal')">ふつう</button>
+    <button class="diff-btn" id="btn-hard" onclick="setDifficulty('hard')">むずかしい</button>
+</div>
+
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+    const socket = io();
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    let players = {};
+    let bullets = [];
+    let map = [];
+    let tileSize = 50;
+    let particles = [];
+    let items = [];
+    let currentDifficulty = 'normal'; // ─── 追加 ───
+    const keys = {};
+
+    window.addEventListener('keydown', e => {
+        if (e.key === 'q' || e.key === 'Q') socket.emit('switchWeapon');
+        keys[e.key] = true;
+    });
+    window.addEventListener('keyup', e => keys[e.key] = false);
+
+    // ─── 追加：ボタンを押した時にサーバーへ通知する関数 ───
+    function setDifficulty(level) {
+        socket.emit('changeDifficulty', level);
+    }
+
+    // ─── 追加：ボタンの見た目（アクティブ状態）を更新する関数 ───
+    function updateButtonUI(activeLevel) {
+        document.querySelectorAll('.diff-btn').forEach(btn => btn.classList.remove('active'));
+        const activeBtn = document.getElementById(`btn-${activeLevel}`);
+        if (activeBtn) activeBtn.classList.add('active');
+    }
+
+    socket.on('init', (data) => {
+        players = data.players;
+        map = data.map;
+        tileSize = data.tileSize;
+        items = data.items || [];
+        currentDifficulty = data.difficulty || 'normal'; // ─── 追加 ───
+        updateButtonUI(currentDifficulty);
+    });
+
+    socket.on('currentPlayers', (serverPlayers) => { players = serverPlayers; });
+    socket.on('playerDisconnected', (id) => { delete players[id]; });
+    socket.on('bulletUpdate', (serverBullets) => { bullets = serverBullets; });
+    socket.on('itemUpdate', (serverItems) => { items = serverItems; });
+    
+    // ─── 追加：難易度が変更された通知をサーバーから受信 ───
+    socket.on('difficultyUpdated', (level) => {
+        currentDifficulty = level;
+        updateButtonUI(level);
+    });
+
+    socket.on('explosion', (data) => {
+        let count = 10; let colors = ['#ffaa00', '#ff5500', '#ffffcc'];
+        if (data.type === 'wall') { count = 6; colors = ['#999999', '#777777', '#ffaa00']; } 
+        else if (data.type === 'kill') { count = 40; colors = ['#ff3300', '#ffcc00', '#ffffff', '#ff00ff']; }
+        for (let i = 0; i < count; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = Math.random() * (data.type === 'kill' ? 6 : 3) + 1;
+            particles.push({
+                x: data.x, y: data.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+                radius: Math.random() * 3 + (data.type === 'kill' ? 3 : 1), alpha: 1, decay: Math.random() * 0.03 + 0.02,
+                color: colors[Math.floor(Math.random() * colors.length)]
+            });
+        }
+    });
+
+    function gameLoop() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // マップの描画
+        if (map.length > 0) {
+            for (let r = 0; r < map.length; r++) {
+                for (let c = 0; c < map[r].length; c++) {
+                    if (map[r][c] === 1) {
+                        ctx.fillStyle = '#555'; ctx.fillRect(c * tileSize, r * tileSize, tileSize, tileSize);
+                        ctx.strokeStyle = '#444'; ctx.strokeRect(c * tileSize, r * tileSize, tileSize, tileSize);
+                    }
+                }
+            }
+        }
+
+        // アイテムの描画
+        items.forEach(item => {
+            if (item.type === 'heal') {
+                ctx.beginPath(); ctx.arc(item.x, item.y, item.radius, 0, Math.PI * 2); ctx.fillStyle = '#00cc44'; ctx.fill(); ctx.closePath();
+                ctx.fillStyle = '#ffffff'; ctx.fillRect(item.x - 2, item.y - 6, 4, 12); ctx.fillRect(item.x - 6, item.y - 2, 12, 4);
+            }
+        });
+
+        const myTank = players[socket.id];
+        if (myTank && myTank.hp > 0) {
+            let moved = false; let nextX = myTank.x; let nextY = myTank.y;
+            if (keys['ArrowUp']) { nextX += Math.cos(myTank.angle) * 3; nextY += Math.sin(myTank.angle) * 3; moved = true; }
+            if (keys['ArrowDown']) { nextX -= Math.cos(myTank.angle) * 2; nextY -= Math.sin(myTank.angle) * 2; moved = true; }
+            if (keys['ArrowLeft']) { myTank.angle -= 0.05; moved = true; }
+            if (keys['ArrowRight']) { myTank.angle += 0.05; moved = true; }
+            if (moved) { socket.emit('playerMovement', { x: nextX, y: nextY, angle: myTank.angle }); }
+            if (keys[' ']) { socket.emit('shoot'); }
+        }
+
+        // 全戦車の描画
+        Object.keys(players).forEach(id => {
+            const tank = players[id];
+            if (tank.hp <= 0) {
+                ctx.fillStyle = '#ff0000'; ctx.font = '14px Arial';
+                const text = id === 'BOT_ENEMY' ? 'BOT 大破 (復活待ち)' : '撃破されました';
+                ctx.fillText(text, tank.x - 50, tank.y); return; 
+            }
+            ctx.save(); ctx.translate(tank.x, tank.y); ctx.rotate(tank.angle); ctx.fillStyle = tank.color; ctx.fillRect(-15, -15, 30, 30);
+            if (tank.currentWeapon === 'cannon') { ctx.fillStyle = '#fff'; ctx.fillRect(0, -5, 25, 10); } 
+            else { ctx.fillStyle = '#aaaaaa'; ctx.fillRect(0, -2, 22, 4); }
+            ctx.restore();
+
+            // HPバー
+            ctx.fillStyle = '#ff0000'; ctx.fillRect(tank.x - 20, tank.y - 30, 40, 5);
+            ctx.fillStyle = '#00ff00'; ctx.fillRect(tank.x - 20, tank.y - 30, 40 * (tank.hp / 100), 5);
+        });
+
+        // 弾の描画
+        bullets.forEach(bullet => {
+            ctx.beginPath(); ctx.arc(bullet.x, bullet.y, bullet.radius, 0, Math.PI * 2); ctx.fillStyle = bullet.color; ctx.fill(); ctx.closePath();
+        });
+
+        // パーティクル
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i]; p.x += p.vx; p.y += p.vy; p.alpha -= p.decay;
+            if (p.alpha <= 0) { particles.splice(i, 1); continue; }
+            ctx.save(); ctx.globalAlpha = p.alpha; ctx.beginPath(); ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2); ctx.fillStyle = p.color; ctx.fill(); ctx.closePath(); ctx.restore();
+        }
+
+        // UI表示
+        if (myTank) {
+            ctx.fillStyle = '#ffffff'; ctx.font = '20px Arial';
+            const weaponName = myTank.currentWeapon === 'cannon' ? '主砲 (強・低速)' : '機銃 (弱・高速連射)';
+            ctx.fillText(`武器 [Qキーで切替]: ${weaponName}`, 20, 40);
+            
+            // ─── 追加：画面内にも現在の難易度テキストを表示 ───
+            ctx.fillStyle = '#aaaaaa';
+            ctx.font = '16px Arial';
+            const diffLabels = { easy: 'かんたん', normal: 'ふつう', hard: 'むずかしい (激辛)' };
+            ctx.fillText(`Bot難易度: ${diffLabels[currentDifficulty]}`, 20, 70);
+        }
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
